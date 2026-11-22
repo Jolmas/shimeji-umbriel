@@ -48,7 +48,7 @@ make PREFIX=/usr WL_SHIMEJI_INCLUDEDIR=/usr/include WL_SHIMEJI_LIBDIR=/usr/lib
 ## Compilación e instalación
 
 ```sh
-cd ~/git/wl_shimeji.umbriel
+cd ~/shimeji-umbriel
 make
 make test                 # pruebas offline del parser de snapshots
 sudo make install         # instala libumbrielsupport.so en $PREFIX/lib/wl_shimeji/
@@ -57,7 +57,7 @@ sudo make install         # instala libumbrielsupport.so en $PREFIX/lib/wl_shime
 También se puede compilar como subdirectorio de `wl_shimeji/src/plugins/`:
 
 ```sh
-cp -r ~/git/wl_shimeji.umbriel /ruta/a/wl_shimeji/src/plugins/umbriel
+cp -r ~/wl_shimeji-umbriel /ruta/a/wl_shimeji/src/plugins/umbriel
 cd /ruta/a/wl_shimeji && make build-plugins && sudo make install-plugins
 ```
 
