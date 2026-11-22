@@ -132,7 +132,7 @@ acción que lee variables locales en su `init`: embebidas (`Fall`, `Dragged`,
 `Look`, `Offset`, ...) y acciones `Move` (`walk_left`, `walk_right`,
 `climb_left`, `climb_right`, ...). En wl_shimeji 0.0.2 eso provoca un SIGSEGV en
 `fall_action_init()` o `move_action_init()`: el primer `actionref` de la mascota
-se crea con `overwritten_locals = NULL` y esas acciones lo desreferencian. El
+se crea con `overwritten_locals = NULL` y esas acciones lo direferencian. El
 overlay se cierra y la mascota nunca llega a dibujarse (o desaparece al elegir
 un behavior de movimiento).
 
