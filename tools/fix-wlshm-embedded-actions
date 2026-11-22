@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Aplica ``fix-shimeji-embedded-actions`` dentro de un fichero .wlshm.
+
+Los prototypes ``.wlshm`` son un cabecera WLPK de 512 bytes seguida de un tar
+sin comprimir. Esta herramienta extrae el tar a un directorio temporal, aplica
+el mismo fix que ``fix-shimeji-embedded-actions`` a ``actions.json`` y vuelve a
+empaquetar el tar conservando el orden y los metadatos de las entradas.
+
+Uso:
+    fix-wlshm-embedded-actions [RUTA ...] [opciones]
+
+Sin argumentos parchea todos los ``*.wlshm`` de
+``~/Documentos/cfg/shimeji-mascot``.
+
+Opciones:
+    -n, --dry-run     solo informa; no modifica ficheros
+    -q, --quiet       menos salida
+    -h, --help        esta ayuda
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import importlib.machinery
+import importlib.util
+import io
+import shutil
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from typing import Iterable, Iterator
+
+
+HEADER_SIZE = 512
+TOOL_NAME = "fix-shimeji-embedded-actions"
+
+
+def load_actions_fixer():
+    tool_path = Path(__file__).with_name(TOOL_NAME)
+    loader = importlib.machinery.SourceFileLoader("shimeji_actions_fixer", str(tool_path))
+    spec = importlib.util.spec_from_loader("shimeji_actions_fixer", loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"No se pudo cargar {tool_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def iter_wlshm(paths: Iterable[Path]) -> Iterator[Path]:
+    for path in paths:
+        path = path.expanduser()
+        if path.is_file() and path.suffix.lower() == ".wlshm":
+            yield path
+        elif path.is_dir():
+            for child in sorted(path.glob("*.wlshm")):
+                yield child
+
+
+def read_wlshm(path: Path) -> tuple[bytes, list[tuple[tarfile.TarInfo, bytes]]]:
+    raw = path.read_bytes()
+    if len(raw) < HEADER_SIZE or raw[:4] != b"WLPK":
+        raise ValueError(f"{path} no es un .wlshm valido")
+    header = raw[:HEADER_SIZE]
+    members = []
+    with tarfile.open(fileobj=io.BytesIO(raw[HEADER_SIZE:]), mode="r:") as archive:
+        for info in archive.getmembers():
+            handle = archive.extractfile(info)
+            members.append((info, handle.read() if handle is not None else b""))
+    return header, members
+
+
+def write_wlshm(path: Path, header: bytes,
+                members: list[tuple[tarfile.TarInfo, bytes]]) -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for info, payload in members:
+            entry = copy.copy(info)
+            entry.size = len(payload)
+            archive.addfile(entry, io.BytesIO(payload))
+    path.write_bytes(header + buffer.getvalue())
+
+
+def patch_wlshm(path: Path, fixer, *, dry_run: bool) -> tuple[int, list[str]]:
+    header, members = read_wlshm(path)
+    names = [info.name for info, _ in members]
+    if "actions.json" not in names:
+        return 0, ["sin actions.json"]
+
+    with tempfile.TemporaryDirectory(prefix="wlshm-fix-") as tmp:
+        directory = Path(tmp)
+        for info, payload in members:
+            if info.name in ("actions.json", "behaviors.json", "manifest.json"):
+                target = directory / info.name
+                target.write_bytes(payload)
+
+        fixed, _already, details = fixer.fix_prototype(
+            directory, dry_run=dry_run, backup_root=None
+        )
+        if not fixed or dry_run:
+            return fixed, details
+
+        # Solo actions.json cambia; el resto se conserva byte a byte.
+        new_actions = (directory / "actions.json").read_bytes()
+        new_members = [
+            (info, new_actions if info.name == "actions.json" else payload)
+            for info, payload in members
+        ]
+        write_wlshm(path, header, new_members)
+    return fixed, details
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_dir = Path.home() / "Documentos/cfg/shimeji-mascot"
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("paths", nargs="*", type=Path,
+                        help="ficheros .wlshm o directorios (por defecto: %(default)s)" % {
+                            "default": default_dir})
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="solo informa, no modifica ficheros")
+    parser.add_argument("-q", "--quiet", action="store_true", help="menos salida")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    paths = args.paths or [Path.home() / "Documentos/cfg/shimeji-mascot"]
+    fixer = load_actions_fixer()
+
+    total = 0
+    for path in iter_wlshm(paths):
+        try:
+            fixed, details = patch_wlshm(path, fixer, dry_run=args.dry_run)
+        except (OSError, ValueError, tarfile.TarError) as exc:
+            print(f"{path}: error: {exc}", file=sys.stderr)
+            continue
+        total += fixed
+        if not args.quiet:
+            prefix = "[simulado] " if args.dry_run else ""
+            if fixed:
+                print(f"{prefix}{path.name}: arregladas {', '.join(details)}")
+            elif details and details[0] == "sin actions.json":
+                print(f"{path.name}: sin actions.json")
+            else:
+                print(f"{path.name}: ya estaba correcto")
+
+    if not args.quiet:
+        action = "se arreglarían" if args.dry_run else "arregladas"
+        print(f"\n{total} acciones {action}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Reescala los sprites de un prototype de wl_shimeji a un tamaño estándar.
+
+Algunos prototypes convertidos traen imágenes de 512x512 con ancla (256,512),
+mientras wl_shimeji espera el tamaño habitual de 128x128 con ancla (64,128). La
+mascota aparece 4 veces más grande y se sale de la pantalla al moverse.
+
+El script detecta el factor de escala a partir de la altura de las imágenes,
+reescribe los ficheros QOI y ajusta proporcionalmente anclas y hotspots. Es
+idempotente: si las imágenes ya tienen el tamaño objetivo no hace nada.
+
+Uso:
+    fix-shimeji-sprite-scale [RUTA ...] [opciones]
+
+Sin argumentos escanea ~/.local/share/wl_shimeji/shimejis/. Cada RUTA puede ser
+un directorio de prototype, un directorio con prototypes o un actions.json.
+
+Opciones:
+    -n, --dry-run          solo informa; no modifica ficheros
+        --height N         altura objetivo (por defecto 128)
+    -b, --backup-dir DIR   directorio base de las copias
+    --no-backup            no guardar copias
+    -q, --quiet            menos salida
+    -h, --help             esta ayuda
+
+Requiere los módulos ``qoi`` y ``Pillow`` (los usa shimejictl). Tras aplicar el
+fix hay que reiniciar shimeji-overlayd.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Iterator
+
+sys.path.insert(0, str(Path.home() / ".local/lib/python3.13/site-packages"))
+try:
+    from PIL import Image
+    from qoi.src.qoi import decode as qoi_decode, encode_img as qoi_encode
+except ImportError as exc:  # pragma: no cover
+    print(f"error: faltan dependencias (qoi, Pillow): {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_json(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: Path, data) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, separators=(",", ":"), ensure_ascii=False)
+        handle.write("\n")
+
+
+def iter_prototypes(paths: Iterable[Path]) -> Iterator[Path]:
+    for path in paths:
+        path = path.expanduser()
+        if not path.exists():
+            print(f"  aviso: no existe {path}", file=sys.stderr)
+            continue
+        if path.is_file() and path.name == "actions.json":
+            yield path.parent
+        elif (path / "actions.json").is_file():
+            yield path
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                if child.is_dir() and (child / "actions.json").is_file():
+                    yield child
+
+
+def prototype_label(directory: Path) -> str:
+    manifest = directory / "manifest.json"
+    if manifest.is_file():
+        try:
+            name = read_json(manifest).get("name")
+            if name:
+                return str(name)
+        except (OSError, ValueError, AttributeError):
+            pass
+    return directory.name
+
+
+def load_qoi(path: Path) -> tuple[Image.Image, str]:
+    data = qoi_decode(path.read_bytes())
+    image = Image.frombytes(data["channels"], (data["width"], data["height"]),
+                            bytes(data["bytes"]))
+    return image, data["channels"]
+
+
+def scale_point(value: int | None, factor: float) -> int | None:
+    return None if value is None else round(value * factor)
+
+
+def fix_prototype(directory: Path, *, target_height: int, dry_run: bool,
+                  backup_root: Path | None) -> tuple[int, int, str]:
+    """Devuelve (imágenes redimensionadas, imágenes ya correctas, mensaje)."""
+    actions_path = directory / "actions.json"
+    if not actions_path.is_file():
+        return 0, 0, ""
+
+    actions = read_json(actions_path)
+    images: list[Path] = []
+    for action in actions:
+        for content in action.get("content", []) or []:
+            for frame in content.get("frames", []) or []:
+                for key in ("image", "image_right"):
+                    name = frame.get(key)
+                    if name:
+                        path = directory / "assets" / name
+                        if path.is_file() and path not in images:
+                            images.append(path)
+
+    heights = []
+    for path in images:
+        try:
+            image, _ = load_qoi(path)
+        except Exception as exc:
+            print(f"  aviso: no se pudo leer {path.name}: {exc}", file=sys.stderr)
+            continue
+        heights.append(image.height)
+
+    if not heights:
+        return 0, 0, "sin imágenes"
+
+    counts = Counter(heights)
+    common_height, _ = counts.most_common(1)[0]
+    if common_height == target_height:
+        return 0, len(images), f"ya estaba a {target_height}px"
+
+    if any(h < target_height for h in heights) or len(counts) > 1:
+        return 0, 0, f"tamaños mixtos {sorted(counts)}, se omite"
+
+    factor = target_height / common_height
+    resized: list[Path] = []
+    for path in images:
+        image, channels = load_qoi(path)
+        new_size = (max(1, round(image.width * factor)), target_height)
+        if image.size == new_size:
+            continue
+        if not dry_run:
+            qoi_encode(image.resize(new_size, Image.Resampling.LANCZOS),
+                       False, str(path))
+        resized.append(path)
+
+    if not dry_run:
+        for action in actions:
+            for content in action.get("content", []) or []:
+                for frame in content.get("frames", []) or []:
+                    frame["image_anchor_x"] = scale_point(frame.get("image_anchor_x"), factor)
+                    frame["image_anchor_y"] = scale_point(frame.get("image_anchor_y"), factor)
+                for hotspot in content.get("hotspots", []) or []:
+                    for key in ("x", "y", "width", "height"):
+                        if key in hotspot:
+                            hotspot[key] = scale_point(hotspot[key], factor)
+
+        if backup_root is not None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            destination = backup_root / stamp / directory.name
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(actions_path, destination / "actions.json")
+            originals = destination / "assets"
+            originals.mkdir(exist_ok=True)
+            for path in resized:
+                shutil.copy2(path, originals / path.name)
+
+        write_json(actions_path, actions)
+
+    return len(resized), 0, f"{common_height}px -> {target_height}px"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Reescala sprites de prototypes al tamaño estándar.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(__doc__ or "").split("Uso:\n", 1)[-1],
+    )
+    parser.add_argument("paths", nargs="*", type=Path,
+                        help="prototype(s) o directorio con prototypes")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="solo informa, no modifica ficheros")
+    parser.add_argument("--height", type=int, default=128,
+                        help="altura objetivo (por defecto: 128)")
+    parser.add_argument("-b", "--backup-dir", type=Path,
+                        default=Path.home() / ".local/share/wl_shimeji/backups/sprite-scale",
+                        help="directorio base de las copias de seguridad")
+    parser.add_argument("--no-backup", action="store_true", help="no guardar copias")
+    parser.add_argument("-q", "--quiet", action="store_true", help="menos salida")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    paths = args.paths or [Path.home() / ".local/share/wl_shimeji/shimejis"]
+    backup_root = None if (args.no_backup or args.dry_run) else args.backup_dir
+
+    total = 0
+    prototypes = 0
+    for directory in iter_prototypes(paths):
+        prototypes += 1
+        resized, ok, message = fix_prototype(
+            directory, target_height=args.height, dry_run=args.dry_run,
+            backup_root=backup_root,
+        )
+        total += resized
+        if not args.quiet and message:
+            prefix = "[simulado] " if args.dry_run else ""
+            state = f"arregladas {resized} imágenes ({message})" if resized else message
+            print(f"{prefix}{prototype_label(directory)}: {state}")
+
+    if not args.quiet:
+        verb = "se reescalarían" if args.dry_run else "reescaladas"
+        print(f"\n{total} imágenes {verb} en {prototypes} prototypes.")
+        if total and not args.dry_run:
+            print("Reinicia shimeji-overlayd para recargar los prototypes.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

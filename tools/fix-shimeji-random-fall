@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Desactiva la conducta aleatoria ``fall`` de prototypes convertidos.
+
+En Shimeji-EE, ``fall`` es una reacción a perder el suelo, no una acción de
+reposo. Algunas conversiones la dejan con frequency=200, de modo que la mascota
+cae periodicamente con velocidad 10 hasta salir de pantalla y "desaparece".
+Los prototypes que funcionan tienen esa frequency a 0.
+
+Uso:
+    fix-shimeji-random-fall [RUTA ...] [-n] [-q]
+
+Sin argumentos escanea ~/.local/share/wl_shimeji/shimejis/. Cada RUTA puede ser
+un directorio de prototype, un directorio con prototypes o un behaviors.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Iterator
+
+
+def read_json(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: Path, data) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, separators=(",", ":"), ensure_ascii=False)
+        handle.write("\n")
+
+
+def iter_prototypes(paths: Iterable[Path]) -> Iterator[Path]:
+    for path in paths:
+        path = path.expanduser()
+        if not path.exists():
+            print(f"  aviso: no existe {path}", file=sys.stderr)
+            continue
+        if path.is_file() and path.name == "behaviors.json":
+            yield path.parent
+        elif (path / "behaviors.json").is_file():
+            yield path
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                if child.is_dir() and (child / "behaviors.json").is_file():
+                    yield child
+
+
+def fix_prototype(directory: Path, *, dry_run: bool,
+                  backup_root: Path | None) -> tuple[int, list[str]]:
+    path = directory / "behaviors.json"
+    if not path.is_file():
+        return 0, []
+    data = read_json(path)
+    changed: list[str] = []
+
+    for section in ("definitions", "root_behavior_list"):
+        for entry in data.get(section, []) or []:
+            if entry.get("name") == "fall" and entry.get("frequency"):
+                changed.append(f"{section}:{entry['frequency']}->0")
+                if not dry_run:
+                    entry["frequency"] = 0
+
+    if changed and not dry_run:
+        if backup_root is not None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            destination = backup_root / stamp / directory.name
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination / "behaviors.json")
+        write_json(path, data)
+    return len(changed), changed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Pone a 0 la frecuencia de la conducta aleatoria 'fall'.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(__doc__ or "").split("Uso:\n", 1)[-1],
+    )
+    parser.add_argument("paths", nargs="*", type=Path)
+    parser.add_argument("-n", "--dry-run", action="store_true")
+    parser.add_argument("-b", "--backup-dir", type=Path,
+                        default=Path.home() / ".local/share/wl_shimeji/backups/fall-frequency")
+    parser.add_argument("--no-backup", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    paths = args.paths or [Path.home() / ".local/share/wl_shimeji/shimejis"]
+    backup_root = None if (args.no_backup or args.dry_run) else args.backup_dir
+    total = 0
+    for directory in iter_prototypes(paths):
+        count, details = fix_prototype(directory, dry_run=args.dry_run,
+                                       backup_root=backup_root)
+        total += count
+        if not args.quiet:
+            name = directory.name
+            if count:
+                prefix = "[simulado] " if args.dry_run else ""
+                print(f"{prefix}{name}: {', '.join(details)}")
+            else:
+                print(f"{name}: sin conducta 'fall' aleatoria")
+    if not args.quiet:
+        verb = "se cambiarían" if args.dry_run else "cambiadas"
+        print(f"\n{total} frecuencias {verb}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

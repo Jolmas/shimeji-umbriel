@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Envuelve en ``Sequence`` las acciones embebidas invocadas directamente por un
+behavior de wl_shimeji 0.0.2.
+
+Motivo
+------
+En wl_shimeji 0.0.2, ``mascot_action_get_next()`` (src/mascot.c) construye la
+primera accion de una mascota copiando ``mascot->current_action``, que esta
+vacia: el ``actionref`` resultante tiene ``overwritten_locals == NULL``. Las
+acciones que leen variables locales en su init (``Embedded`` con tipo fall,
+look, offset, jump, drag, ..., y las acciones ``Move`` -> ``TargetX``/
+``TargetY``) desreferencian ese puntero y provocan un SIGSEGV que cierra el
+overlay. Por eso la mascota "no aparece" o desaparece al cambiar de behavior.
+
+Los prototypes correctos (Shimeji, Miku, ...) no llaman a estas acciones
+directamente desde el behavior, sino a una accion ``Sequence`` que las
+referencia (el parser si reserva ``overwritten_locals`` para las referencias
+de una Sequence). Este script reescribe los prototypes con el fallo para que
+tengan esa misma estructura:
+
+    Fall        (Embedded)  ->  FallEmbedded        (Embedded)
+    Fall        (Sequence)  ->  referencia a FallEmbedded
+    walk_right  (Move)      ->  walk_rightInner      (Move)
+    walk_right  (Sequence)  ->  referencia a walk_rightInner
+
+El behavior sigue apuntando al nombre original, que ahora es el envoltorio
+``Sequence``. Es idempotente: si el envoltorio ya existe no toca nada.
+
+Uso
+---
+    fix-shimeji-embedded-actions [RUTA ...] [opciones]
+
+Sin argumentos escanea ~/.local/share/wl_shimeji/shimejis/*. Cada RUTA puede ser
+un directorio de prototype (el que contiene actions.json) o un directorio con
+varios prototypes.
+
+Opciones:
+    -n, --dry-run          solo informa; no modifica ficheros
+        --no-backup        no guarda copias de los JSON originales
+    -b, --backup-dir DIR   directorio base de las copias
+                           (por defecto ~/.local/share/wl_shimeji/backups/
+                            /embedded-actions)
+    -q, --quiet            menos salida
+    -h, --help             esta ayuda
+
+Tras aplicar el fix hay que reiniciar shimeji-overlayd para que recargue los
+prototypes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Iterator
+
+
+def read_json(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: Path, data) -> None:
+    # Los prototypes convertidos por shimejictl usan JSON compacto.
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, separators=(",", ":"), ensure_ascii=False)
+        handle.write("\n")
+
+
+def iter_prototypes(paths: Iterable[Path]) -> Iterator[Path]:
+    """Devuelve directorios que contienen actions.json."""
+    for path in paths:
+        path = path.expanduser()
+        if not path.exists():
+            print(f"  aviso: no existe {path}", file=sys.stderr)
+            continue
+        if path.is_file() and path.name == "actions.json":
+            yield path.parent
+        elif (path / "actions.json").is_file():
+            yield path
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                if child.is_dir() and (child / "actions.json").is_file():
+                    yield child
+
+
+def prototype_label(directory: Path) -> str:
+    manifest = directory / "manifest.json"
+    if manifest.is_file():
+        try:
+            name = read_json(manifest).get("name")
+            if name:
+                return str(name)
+        except (OSError, ValueError, AttributeError):
+            pass
+    return directory.name
+
+
+def index_by_name(actions: list[dict]) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for action in actions:
+        name = action.get("name")
+        if name and name not in result:
+            result[name] = action
+    return result
+
+
+# Tipos de accion cuyo init lee actionref->overwritten_locals[ID]->used. Si un
+# behavior los invoca directamente, el primer actionref trae ese puntero a NULL.
+# Ver src/actions/{fall,move,look,offset,jump,breed,...}.c de wl_shimeji 0.0.2.
+VULNERABLE_MOVE_TYPES = {"Move"}
+INNER_SUFFIXES = ("Embedded", "Inner")
+
+
+def is_vulnerable(action: dict | None) -> bool:
+    if not action:
+        return False
+    kind = action.get("type")
+    if kind in VULNERABLE_MOVE_TYPES:
+        return True
+    if kind != "Embedded":
+        return False
+    embedded_type = action.get("embedded_type")
+    return bool(embedded_type) and str(embedded_type).lower() != "none"
+
+
+def already_fixed(actions: list[dict], name: str) -> bool:
+    """¿Existe ya un Sequence con ese nombre que referencie a una accion vulnerable?"""
+    by_name = index_by_name(actions)
+    wrapper = by_name.get(name)
+    if not wrapper or wrapper.get("type") != "Sequence":
+        return False
+    for item in wrapper.get("content", []):
+        if item.get("type") != "ActionReference":
+            continue
+        inner_name = item.get("action_name")
+        if inner_name and inner_name != name and is_vulnerable(by_name.get(inner_name)):
+            return True
+    return False
+
+
+def unique_inner_name(actions: list[dict], name: str, action: dict) -> str:
+    used = {a.get("name") for a in actions}
+    base_suffix = "Embedded" if action.get("type") == "Embedded" else "Inner"
+    candidate = f"{name}{base_suffix}"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{name}{base_suffix}{suffix}"
+        suffix += 1
+    return candidate
+
+
+def make_wrapper(name: str, embedded_name: str) -> dict:
+    return {
+        "type": "Sequence",
+        "name": name,
+        "content": [
+            {
+                "type": "ActionReference",
+                "action_name": embedded_name,
+                "duration": None,
+                "condition": None,
+                "locals_overrides": {},
+                "locals_count": 0,
+            }
+        ],
+        "content_count": 1,
+        "local_variables": {},
+        "local_variables_count": 0,
+        "embedded_type": None,
+        "loop": False,
+        "condition": None,
+        "border_type": "Any",
+    }
+
+
+def fix_prototype(directory: Path, *, dry_run: bool,
+                  backup_root: Path | None) -> tuple[int, int, list[str]]:
+    """Devuelve (n_arregladas, n_ya_ok, mensajes)."""
+    actions_path = directory / "actions.json"
+    behaviors_path = directory / "behaviors.json"
+    if not actions_path.is_file() or not behaviors_path.is_file():
+        return 0, 0, []
+
+    actions = read_json(actions_path)
+    behaviors = read_json(behaviors_path)
+
+    by_name = index_by_name(actions)
+
+    # Solo nos interesa lo que un behavior invoca como accion inicial: ahi es
+    # donde el actionref llega con overwritten_locals == NULL.
+    called_directly: list[str] = []
+    for definition in behaviors.get("definitions", []) or []:
+        action_name = definition.get("action")
+        if action_name in by_name and is_vulnerable(by_name[action_name]):
+            if action_name not in called_directly:
+                called_directly.append(action_name)
+
+    # Envoltorios ya aplicados en ejecuciones anteriores.
+    wrapped: list[str] = []
+    for name, action in list(by_name.items()):
+        if not is_vulnerable(action):
+            continue
+        for suffix in INNER_SUFFIXES:
+            if name.endswith(suffix):
+                original = name[: -len(suffix)]
+                if already_fixed(actions, original) and original not in wrapped:
+                    wrapped.append(original)
+                break
+
+    if not called_directly:
+        return 0, len(wrapped), wrapped
+
+    fixed: list[str] = []
+    already: list[str] = list(wrapped)
+    for name in called_directly:
+        if already_fixed(actions, name):
+            if name not in already:
+                already.append(name)
+            continue
+        inner_name = unique_inner_name(actions, name, by_name[name])
+        by_name[name]["name"] = inner_name
+        actions.append(make_wrapper(name, inner_name))
+        by_name = index_by_name(actions)
+        fixed.append(f"{name} -> {inner_name}")
+
+    if not fixed or dry_run:
+        return len(fixed), len(already), fixed or already
+
+    if backup_root is not None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        destination = backup_root / stamp / directory.name
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(actions_path, destination / "actions.json")
+        shutil.copy2(behaviors_path, destination / "behaviors.json")
+
+    write_json(actions_path, actions)
+    return len(fixed), len(already), fixed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_root = Path.home() / ".local/share/wl_shimeji/shimejis"
+    parser = argparse.ArgumentParser(
+        description="Arregla actions embebidas/Move invocadas directamente por behaviors.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Uso\n---", 1)[-1] if __doc__ else None,
+    )
+    parser.add_argument(
+        "paths", nargs="*", type=Path,
+        help="prototype(s) o directorio con prototypes (por defecto: %(default)s)" % {
+            "default": default_root
+        },
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="solo informa, no modifica ficheros")
+    parser.add_argument("--no-backup", action="store_true",
+                        help="no guardar copias de los JSON originales")
+    parser.add_argument("-b", "--backup-dir", type=Path,
+                        default=Path.home() / ".local/share/wl_shimeji/backups/embedded-actions",
+                        help="directorio base de las copias de seguridad")
+    parser.add_argument("-q", "--quiet", action="store_true", help="menos salida")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    paths = args.paths or [Path.home() / ".local/share/wl_shimeji/shimejis"]
+    backup_root = None if (args.no_backup or args.dry_run) else args.backup_dir
+
+    total_fixed = 0
+    total_prototypes = 0
+    for directory in iter_prototypes(paths):
+        total_prototypes += 1
+        label = prototype_label(directory)
+        fixed, already_count, details = fix_prototype(
+            directory,
+            dry_run=args.dry_run,
+            backup_root=backup_root,
+        )
+        total_fixed += fixed
+        if not args.quiet:
+            if fixed:
+                prefix = "[simulado] " if args.dry_run else ""
+                print(f"{prefix}{label}: arregladas {', '.join(details)}")
+            elif already_count:
+                print(f"{label}: ya estaba correcto ({', '.join(details)})")
+            else:
+                print(f"{label}: sin acciones vulnerables directas")
+
+    if not args.quiet:
+        action = "se arreglarían" if args.dry_run else "arregladas"
+        print(f"\n{total_fixed} acciones {action} en {total_prototypes} prototypes.")
+        if total_fixed and not args.dry_run:
+            print("Reinicia shimeji-overlayd para recargar los prototypes.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
