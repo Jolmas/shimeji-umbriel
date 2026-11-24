@@ -82,6 +82,7 @@ def main():
     server = FakeUmbriel(tmp / "umbriel.sock")
     server.start()
     os.environ["UMBRIEL_SOCKET"] = str(server.path)
+    os.environ["UMBRIEL_IE_TOP_INSET"] = "-2"
 
     ctypes.CDLL(str(HELPER), mode=ctypes.RTLD_GLOBAL)
     lib = ctypes.CDLL(str(PLUGIN))
@@ -114,7 +115,9 @@ def main():
     assert reported, "no window state was reported"
     active_reports = [entry for entry in reported if entry[0]]
     assert active_reports, "no active window was reported"
-    assert active_reports[-1] == (True, 100, 200, 800, 600), active_reports
+    # El plugin sube 2 px la IE por encima del marco que informa Umbriel, para
+    # que los pies de las mascotas coincidan con el borde visible.
+    assert active_reports[-1] == (True, 100, 198, 800, 602), active_reports
 
     assert lib.wl_shimeji_plugin_move(ctypes.byref(handle), 500, 400) == 0
     deadline = time.monotonic() + 2

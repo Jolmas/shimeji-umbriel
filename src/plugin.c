@@ -32,8 +32,13 @@
 #define PLUGIN_VERSION "0.1.0"
 #define PLUGIN_AUTHOR  "luis"
 
-/* Optional settings file, shared with wl-shimeji-gui. UMBRIEL_IE_MODE wins. */
-#define IE_CONFIG_RELPATH "wl_shimeji/umbriel-support.conf"
+/* Optional settings file, shared with wl-shimeji-gui. Environment wins. */
+#define IE_CONFIG_RELPATH ".config/wl_shimeji/umbriel-support.conf"
+
+/* Umbriel reports the window frame top edge, while the visible surface starts
+ * a few pixels lower. Move the interaction surface down so mascots stand
+ * closer to the window instead of floating above its shadow. */
+#define IE_TOP_INSET_DEFAULT 5
 
 static plugin_t *g_plugin = NULL;
 static set_active_ie_func g_set_active_ie = NULL;
@@ -41,6 +46,7 @@ static window_moved_hint_func g_window_moved_hint = NULL;
 static umb_state_t g_state;
 static umb_ipc_t g_ipc;
 static umb_ie_mode_t g_ie_mode = UMB_IE_MODE_ACTIVE;
+static int32_t g_ie_top_inset = IE_TOP_INSET_DEFAULT;
 
 /* Last geometry published to wl_shimeji, used to detect moves. */
 static bool g_last_valid = false;
@@ -94,7 +100,18 @@ static void publish_snapshot(void)
     g_last_h = active.h;
 
     if (g_set_active_ie != NULL) {
-        g_set_active_ie(true, active.x, active.y, active.w, active.h);
+        int32_t inset = g_ie_top_inset;
+        int32_t y = active.y;
+        int32_t h = active.h;
+
+        /* Un inset negativo sube la IE por encima del marco que informa
+         * Umbriel; útil para que los pies coincidan con el borde visible. */
+        if (inset != 0 && h > 1 && (inset > 0 ? inset < h : y > INT32_MIN - inset)) {
+            y += inset;
+            h -= inset;
+        }
+
+        g_set_active_ie(true, active.x, y, active.w, h);
     }
 }
 
@@ -234,6 +251,86 @@ static void load_ie_mode(void)
     INFO("[UmbrielSupport] IE mode: %s", umb_ie_mode_name(g_ie_mode));
 }
 
+static bool read_config_top_inset(int32_t *out)
+{
+    char *path = ie_config_path();
+    char line[512];
+    FILE *file;
+    bool found = false;
+
+    if (path == NULL) {
+        return false;
+    }
+    file = fopen(path, "r");
+    if (file == NULL) {
+        free(path);
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *comment = strchr(line, '#');
+        char *equals;
+        char *value;
+        char *end;
+        long number;
+
+        if (comment != NULL) {
+            *comment = '\0';
+        }
+        equals = strchr(line, '=');
+        if (equals == NULL) {
+            continue;
+        }
+        *equals = '\0';
+        value = equals + 1;
+        trim_spaces(line);
+        trim_spaces(value);
+        if (strcasecmp(line, "ie_top_inset") != 0 &&
+            strcasecmp(line, "UMBRIEL_IE_TOP_INSET") != 0) {
+            continue;
+        }
+        number = strtol(value, &end, 10);
+        if (end != value && *end == '\0' && number >= -64 && number <= 64) {
+            *out = (int32_t)number;
+            found = true;
+        } else {
+            WARN("[UmbrielSupport] Invalid ie_top_inset '%s' in %s "
+                 "(use an integer from -64 to 64); using %d",
+                 value, path, IE_TOP_INSET_DEFAULT);
+            *out = IE_TOP_INSET_DEFAULT;
+        }
+        break;
+    }
+
+    fclose(file);
+    free(path);
+    return found;
+}
+
+static void load_ie_top_inset(void)
+{
+    const char *value = getenv("UMBRIEL_IE_TOP_INSET");
+    char *end;
+    long number;
+
+    g_ie_top_inset = IE_TOP_INSET_DEFAULT;
+    if (value != NULL && value[0] != '\0') {
+        number = strtol(value, &end, 10);
+        if (end != value && *end == '\0' && number >= -64 && number <= 64) {
+            g_ie_top_inset = (int32_t)number;
+        } else {
+            WARN("[UmbrielSupport] Invalid UMBRIEL_IE_TOP_INSET '%s' "
+                 "(use an integer from -64 to 64); using %d",
+                 value, IE_TOP_INSET_DEFAULT);
+        }
+    } else if (read_config_top_inset(&g_ie_top_inset)) {
+        INFO("[UmbrielSupport] IE top inset: %d px (umbriel-support.conf)",
+             g_ie_top_inset);
+        return;
+    }
+    INFO("[UmbrielSupport] IE top inset: %d px", g_ie_top_inset);
+}
+
 static char *fallback_socket_path(void)
 {
     const char *display = getenv("WAYLAND_DISPLAY");
@@ -275,6 +372,7 @@ int wl_shimeji_plugin_init(plugin_t *self, set_cursor_pos_func set_cursor,
     g_set_active_ie = set_active_ie;
     g_window_moved_hint = window_moved_hint;
     load_ie_mode();
+    load_ie_top_inset();
     umb_state_reset(&g_state);
     g_last_valid = false;
 

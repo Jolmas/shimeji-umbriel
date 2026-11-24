@@ -48,7 +48,7 @@ make PREFIX=/usr WL_SHIMEJI_INCLUDEDIR=/usr/include WL_SHIMEJI_LIBDIR=/usr/lib
 ## Compilación e instalación
 
 ```sh
-cd ~/shimeji-umbriel
+cd ~/git/wl_shimeji.umbriel
 make
 make test                 # pruebas offline del parser de snapshots
 sudo make install         # instala libumbrielsupport.so en $PREFIX/lib/wl_shimeji/
@@ -57,7 +57,7 @@ sudo make install         # instala libumbrielsupport.so en $PREFIX/lib/wl_shime
 También se puede compilar como subdirectorio de `wl_shimeji/src/plugins/`:
 
 ```sh
-cp -r ~/wl_shimeji-umbriel /ruta/a/wl_shimeji/src/plugins/umbriel
+cp -r ~/git/wl_shimeji.umbriel /ruta/a/wl_shimeji/src/plugins/umbriel
 cd /ruta/a/wl_shimeji && make build-plugins && sudo make install-plugins
 ```
 
@@ -101,6 +101,37 @@ La variable de entorno tiene prioridad sobre el archivo. Esta opción también
 está disponible en `wl-shimeji-gui` → *Ajustes* → *Interacción y
 comportamiento* → «Mascotas sobre ventanas (UmbrielSupport)».
 
+#### Separación respecto al borde de la ventana
+
+Umbriel informa del borde superior del marco. El plugin puede bajar el borde
+superior de la IE (`interactive element`) para separar las mascotas de ese
+borde, o subirlo con un valor negativo. El valor por defecto es `5` px; con
+`0` los pies coinciden con el borde del **área de contenido** que reporta
+Umbriel, que queda ~30 px por debajo del borde visible de la ventana (la barra
+de título). Para que los pies toquen el borde visible usa `-30`.
+
+El archivo se lee desde `~/.config/wl_shimeji/umbriel-support.conf` (o
+`$XDG_CONFIG_HOME/wl_shimeji/umbriel-support.conf`):
+
+```ini
+# Ventana en la que las mascotas pueden pararse
+ie_mode=active
+# Cuánto bajar el borde superior de la IE (píxeles; negativo lo sube)
+ie_top_inset=-30
+```
+
+También puedes usar `ie_top_inset` con un entero de -64 a 64 desde el entorno
+del daemon:
+
+```sh
+UMBRIEL_IE_TOP_INSET=-30 shimeji-overlayd ...
+```
+
+La variable de entorno tiene prioridad sobre el archivo. Un valor de `0`
+publica la geometría tal cual la da Umbriel; `-30` la sube hasta el borde
+visible de la barra de título.
+`wl-shimeji-gui` conserva esta clave al guardar `ie_mode`.
+
 Además, wl_shimeji debe tener `ie_interactions=true` en
 `shimeji-overlayd.conf`. En wl_shimeji 0.0.2 las acciones IE (`FallWithIe`,
 `WalkWithIe`, `ThrowIe`) también comprueban `ie_throwing`, así que déjalo en
@@ -132,7 +163,7 @@ acción que lee variables locales en su `init`: embebidas (`Fall`, `Dragged`,
 `Look`, `Offset`, ...) y acciones `Move` (`walk_left`, `walk_right`,
 `climb_left`, `climb_right`, ...). En wl_shimeji 0.0.2 eso provoca un SIGSEGV en
 `fall_action_init()` o `move_action_init()`: el primer `actionref` de la mascota
-se crea con `overwritten_locals = NULL` y esas acciones lo direferencian. El
+se crea con `overwritten_locals = NULL` y esas acciones lo desreferencian. El
 overlay se cierra y la mascota nunca llega a dibujarse (o desaparece al elegir
 un behavior de movimiento).
 

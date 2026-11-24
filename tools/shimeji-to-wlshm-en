@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""Converter from shimeji.zip bundles to wl_shimeji .wlshm prototypes.
+
+Steps performed by this script
+------------------------------
+1. Detect the input format:
+   - For a real Shimeji-EE instance (conf/actions.xml + conf/behaviors.xml + img/),
+     delegate to `shimejictl convert` (the official converter).
+   - For a shimeji bundle (manifest.json + animation.json + sprites/*.webp),
+     continue with step 2, because the official converter rejects it with
+     "Passed input is not a valid Shimeji-EE instance".
+2. Extract the ZIP, take the logic (scripts/actions/behaviors) from an already
+   installed wl_shimeji prototype, replace the 46 sprites with the ones from
+   the bundle (resized to 128x128) and pack everything in WLPK format:
+   512-byte header + tar containing manifest/scripts/actions/behaviors/assets.
+3. Validate the result: WLPK header, tar members, parseable JSON and
+   decodable QOI images.
+4. Apply the fixes to the generated .wlshm, in this order and without
+   intermediate files (everything is done on the tar in memory):
+   - scale:    resize sprites and anchors to the standard height (128px).
+   - anchor:   align image_anchor_y with the sprite's visible bottom edge.
+   - fall:     set the frequency of the random ``fall`` behavior to 0.
+   - embedded: wrap embedded/Move actions called directly by a behavior in
+               ``Sequence`` (prevents the SIGSEGV in 0.0.2).
+   - cover:    remove unreferenced "No image" placeholders and create a cover
+               named after the character for the GUI.
+   Every fix is idempotent. Select them with ``--fixes`` or skip all of them
+   with ``--no-fix``. With ``--fix-only`` the input is an already converted
+   .wlshm and only the fixes are applied.
+5. Re-validate the corrected package and, optionally, import it (``--import``).
+
+Usage:
+    shimeji-to-wlshm INPUT.zip [-o OUTPUT.wlshm] [-b PROTOTYPE_BASE]
+                    [-f] [--fixes scale,anchor,fall,embedded,cover]
+                    [--no-fix] [--height N] [--import]
+    shimeji-to-wlshm INPUT.wlshm --fix-only [-o OUTPUT.wlshm] [-f]
+
+Examples:
+    shimeji-to-wlshm ~/Downloads/shimeji.zip
+    shimeji-to-wlshm ~/Downloads/shimeji.zip -o ~/Downloads/SailorMoon.wlshm --import
+    shimeji-to-wlshm ~/wlshm/Shimeji.Miku.wlshm --fix-only -o ~/wlshm/Shimeji.Miku.wlshm -f
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import io
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/lib/python3.13/site-packages"))
+
+from PIL import Image
+from qoi.src.qoi import decode as qoi_decode, encode as qoi_encode
+
+SHIMEJIS = Path.home() / ".local/share/wl_shimeji/shimejis"
+HEADER_SIZE = 512
+FIX_ORDER = ("scale", "anchor", "fall", "embedded", "cover")
+
+# Mapping between the shimeN.qoi files of the base behavior and the sprites
+# of the shimeji bundle. Obtained by aligning the animations in animation.json
+# with the actions of the base prototype (Stand/Walk/Fall/Climb/Sit/Bounce...).
+SPRITE_FOR = {
+     1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+     11: 10, 12: 11, 13: 12, 14: 13,
+     15: 10, 16: 25, 17: 10, 18: 17, 19: 18, 20: 19, 21: 20, 22: 21,
+     23: 22, 24: 23, 25: 24, 26: 25, 27: 30, 28: 30, 29: 10, 30: 30,
+     31: 31, 32: 32, 33: 35,
+     34: 1, 35: 2, 36: 3, 37: 67,
+     38: 0, 39: 0, 40: 0, 41: 0,
+     42: 0, 43: 1, 44: 2, 45: 3, 46: 0,
+}
+
+
+def slugify(text: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return text or "shimeji"
+
+
+class Wlshm:
+    """A .wlshm (WLPK header + tar) loaded into memory.
+
+    Preserves the order and metadata of the tar members; ``save()``
+    rewrites the file only if a fix changed a member.
+    """
+
+    def __init__(self, raw: bytes):
+        if len(raw) < HEADER_SIZE or raw[:4] != b"WLPK":
+            raise ValueError("invalid WLPK header")
+        self.header = raw[:HEADER_SIZE]
+        self.members: list[tuple[tarfile.TarInfo, bytes]] = []
+        with tarfile.open(fileobj=io.BytesIO(raw[HEADER_SIZE:]), mode="r:") as archive:
+            for info in archive.getmembers():
+                handle = archive.extractfile(info)
+                self.members.append((info, handle.read() if handle is not None else b""))
+        self.dirty = False
+
+    @classmethod
+    def open(cls, path: Path) -> Wlshm:
+        return cls(path.read_bytes())
+
+    def names(self) -> list[str]:
+        return [info.name for info, _ in self.members]
+
+    def has(self, name: str) -> bool:
+        return name in self.names()
+
+    def get(self, name: str) -> bytes | None:
+        for info, payload in self.members:
+            if info.name == name:
+                return payload
+        return None
+
+    def get_json(self, name: str):
+        payload = self.get(name)
+        if payload is None:
+            raise ValueError(f"missing {name} in the package")
+        return json.loads(payload)
+
+    def set(self, name: str, payload: bytes) -> None:
+        for index, (info, old) in enumerate(self.members):
+            if info.name == name:
+                if old != payload:
+                    self.members[index] = (info, payload)
+                    self.dirty = True
+                return
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        self.members.append((info, payload))
+        self.dirty = True
+
+    def set_json(self, name: str, data, *, compact: bool = True) -> None:
+        if compact:
+            payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        else:
+            payload = json.dumps(data, ensure_ascii=False)
+        self.set(name, payload.encode("utf-8"))
+
+    def remove(self, name: str) -> None:
+        remaining = [(info, payload) for info, payload in self.members
+                     if info.name != name]
+        if len(remaining) != len(self.members):
+            self.members = remaining
+            self.dirty = True
+
+    def save(self) -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            for info, payload in self.members:
+                entry = copy.copy(info)
+                entry.size = len(payload)
+                archive.addfile(entry, io.BytesIO(payload))
+        return self.header + buffer.getvalue()
+
+
+def validate_wlshm(w: Wlshm, *, min_assets: int = 1) -> dict:
+    """Check that the .wlshm is readable by wl_shimeji."""
+    required = {"manifest.json", "scripts.json", "actions.json", "behaviors.json"}
+    missing = required - set(w.names())
+    if missing:
+        raise ValueError(f"missing tar members: {sorted(missing)}")
+    manifest = w.get_json("manifest.json")
+    actions = w.get_json("actions.json")
+    behaviors = w.get_json("behaviors.json")
+    assets = [name for name in w.names()
+              if name.startswith("assets/") and name.endswith(".qoi")]
+    if len(assets) < min_assets:
+        raise ValueError(f"only {len(assets)} QOI assets (expected {min_assets})")
+    qoi_decode(w.get(assets[0]))
+
+    name = manifest.get("display_name") or manifest.get("name") or "?"
+    print(f"  validated: {name} | {len(actions)} actions | "
+          f"{len(behaviors.get('definitions', []))} behaviors | "
+          f"{len(assets)} sprites")
+    return manifest
+
+
+def convert_ee(input_zip: Path, output: Path, force: bool) -> Path:
+    """Step 1a: real Shimeji-EE instance -> official converter."""
+    if shutil.which("shimejictl") is None:
+        raise RuntimeError("shimejictl not found in PATH")
+    with tempfile.TemporaryDirectory() as td:
+        result = subprocess.run(
+            ["shimejictl", "convert", str(input_zip), "-O", td] + (["-f"] if force else []),
+            input="A\n", text=True, capture_output=True,
+        )
+        print(result.stdout.strip())
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "shimejictl convert failed")
+        converted = sorted(Path(td).glob("*.wlshm"))
+        if not converted:
+            raise RuntimeError("shimejictl convert produced no .wlshm")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(converted[0], output)
+    return output
+
+
+def convert_shimeji(input_zip: Path, output: Path, base_name: str, force: bool) -> Path:
+    """Step 1b/2: shimeji bundle -> .wlshm reusing a base prototype."""
+    base = SHIMEJIS / base_name
+    if not (base / "actions.json").is_file():
+        raise RuntimeError(f"base prototype does not exist: {base}")
+
+    with zipfile.ZipFile(input_zip) as zf:
+        names = zf.namelist()
+        if "manifest.json" not in names or "animation.json" not in names:
+            raise RuntimeError("the ZIP is neither a shimeji bundle nor a Shimeji-EE instance")
+        bundle_manifest = json.loads(zf.read("manifest.json"))
+
+        with tempfile.TemporaryDirectory() as td:
+            zf.extractall(td)
+            sprite_dir = Path(td) / "sprites"
+
+            display_name = bundle_manifest.get("name") or input_zip.stem
+            name = "Shimeji." + slugify(display_name)
+
+            manifest = json.loads((base / "manifest.json").read_text(encoding="utf-8"))
+            manifest.update({
+                "name": name,
+                "display_name": display_name,
+                "description": f"Converted from {input_zip.name}",
+                "artist": bundle_manifest.get("author", {}).get("name") or "Local Creator",
+            })
+            actions = json.loads((base / "actions.json").read_text(encoding="utf-8"))
+            behaviors = (base / "behaviors.json").read_text(encoding="utf-8")
+            scripts = (base / "scripts.json").read_text(encoding="utf-8")
+
+            memfile = io.BytesIO()
+            with tarfile.open(fileobj=memfile, mode="w") as tar:
+                def add(member_name: str, data: bytes) -> None:
+                    info = tarfile.TarInfo(member_name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+
+                add("manifest.json", json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
+                add("scripts.json", scripts.encode("utf-8"))
+                add("actions.json", json.dumps(
+                    actions, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+                add("behaviors.json", behaviors.encode("utf-8"))
+
+                dirinfo = tarfile.TarInfo("assets/")
+                dirinfo.type = tarfile.DIRTYPE
+                tar.addfile(dirinfo)
+
+                for n in range(1, 47):
+                    sprite = sprite_dir / f"{SPRITE_FOR[n]:04d}.webp"
+                    if not sprite.is_file():
+                        raise RuntimeError(f"missing sprite {sprite.name} in the bundle")
+                    image = Image.open(sprite).convert("RGBA")
+                    image = image.resize((128, 128), Image.LANCZOS)
+                    add(f"assets/shime{n}.qoi", encode_qoi(image))
+
+            prefix = b"WLPK"
+            for value in (manifest["name"], manifest["version"]):
+                raw_value = value.encode("utf-8")
+                prefix += bytes([len(raw_value)]) + raw_value
+            prefix += b"\x00" * (HEADER_SIZE - len(prefix))
+
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(prefix + memfile.getvalue())
+    return output
+
+
+def detect_format(input_zip: Path) -> str:
+    with zipfile.ZipFile(input_zip) as zf:
+        names = set(zf.namelist())
+        if any(n.startswith("conf/") for n in names) and any(n.startswith("img/") for n in names):
+            return "ee"
+        if "animation.json" in names and "manifest.json" in names:
+            return "shimeji"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Fixes. All of them receive the in-memory .wlshm, return the list of
+# applied changes (empty when nothing needed doing) and are idempotent.
+# ---------------------------------------------------------------------------
+
+def load_qoi(data: bytes) -> Image.Image:
+    decoded = qoi_decode(data)
+    return Image.frombytes(decoded["channels"],
+                           (decoded["width"], decoded["height"]),
+                           bytes(decoded["bytes"]))
+
+
+def encode_qoi(image: Image.Image) -> bytes:
+    image = image.convert("RGBA")
+    return qoi_encode(image.tobytes(), image.width, image.height, True, False)
+
+
+def iter_frames(actions: list[dict]):
+    for action in actions or []:
+        for content in action.get("content", []) or []:
+            for frame in content.get("frames", []) or []:
+                yield frame
+
+
+def referenced_images(actions: list[dict]) -> set[str]:
+    refs: set[str] = set()
+    for frame in iter_frames(actions):
+        for key in ("image", "image_right"):
+            if frame.get(key):
+                refs.add(str(frame[key]))
+    return refs
+
+
+def scale_point(value, factor: float):
+    return None if value is None else round(value * factor)
+
+
+def fix_sprite_scale(w: Wlshm, target_height: int = 128) -> list[str]:
+    """Resize the referenced sprites and their anchors/hotspots."""
+    if not w.has("actions.json"):
+        return []
+    actions = w.get_json("actions.json")
+    images = sorted({name for name in referenced_images(actions)
+                     if w.has(f"assets/{name}")})
+    heights = []
+    for name in images:
+        try:
+            heights.append(load_qoi(w.get(f"assets/{name}")).height)
+        except Exception as exc:
+            print(f"  warning: could not read {name}: {exc}", file=sys.stderr)
+
+    if not heights:
+        return []
+    counts = Counter(heights)
+    common_height, _ = counts.most_common(1)[0]
+    if common_height == target_height:
+        return []
+    if any(height < target_height for height in heights) or len(counts) > 1:
+        print(f"  warning: mixed sizes {sorted(counts)}, skipping resize",
+              file=sys.stderr)
+        return []
+
+    factor = target_height / common_height
+    resized = []
+    for name in images:
+        member = f"assets/{name}"
+        image = load_qoi(w.get(member))
+        new_size = (max(1, round(image.width * factor)), target_height)
+        if image.size == new_size:
+            continue
+        w.set(member, encode_qoi(image.resize(new_size, Image.Resampling.LANCZOS)))
+        resized.append(name)
+
+    for action in actions:
+        for content in action.get("content", []) or []:
+            for frame in content.get("frames", []) or []:
+                for key in ("image_anchor_x", "image_anchor_y"):
+                    if key in frame:
+                        frame[key] = scale_point(frame[key], factor)
+            for hotspot in content.get("hotspots", []) or []:
+                for key in ("x", "y", "width", "height"):
+                    if key in hotspot:
+                        hotspot[key] = scale_point(hotspot[key], factor)
+
+    if resized:
+        w.set_json("actions.json", actions)
+    return [f"{len(resized)} sprites {common_height}px -> {target_height}px"]
+
+
+def transparent_bottom(data: bytes) -> tuple[int, int]:
+    """Fully transparent rows below the sprite."""
+    decoded = qoi_decode(data)
+    channels = decoded["channels"]
+    width, height = decoded["width"], decoded["height"]
+    raw = bytes(decoded["bytes"])
+    step = len(channels)
+    count = 0
+    for y in range(height - 1, -1, -1):
+        row = raw[y * width * step:(y + 1) * width * step]
+        if any(row[i + 3] if step == 4 else 255 for i in range(0, len(row), step)):
+            break
+        count += 1
+    return count, height
+
+
+def fix_sprite_anchor(w: Wlshm) -> list[str]:
+    """Align the visible feet with the bottom edge of the IE."""
+    if not w.has("actions.json"):
+        return []
+    actions = w.get_json("actions.json")
+    changed = 0
+    for frame in iter_frames(actions):
+        for key in ("image", "image_right"):
+            image = frame.get(key)
+            if not image:
+                continue
+            member = f"assets/{image}"
+            data = w.get(member)
+            if data is None:
+                continue
+            bottom, height = transparent_bottom(data)
+            anchor = frame.get("image_anchor_y")
+            if anchor is None or anchor < height - 1:
+                continue  # no es un ancla de suelo
+            applied = int(frame.get("wlshm_bottom_trim", 0))
+            delta = bottom - applied
+            if delta == 0:
+                continue
+            frame["image_anchor_y"] = int(anchor) - delta
+            frame["wlshm_bottom_trim"] = bottom
+            changed += 1
+
+    if changed:
+        w.set_json("actions.json", actions)
+    return [f"{changed} frames adjusted"] if changed else []
+
+
+def fix_random_fall(w: Wlshm) -> list[str]:
+    """Disable the random ``fall`` behavior."""
+    if not w.has("behaviors.json"):
+        return []
+    data = w.get_json("behaviors.json")
+    changed: list[str] = []
+    for section in ("definitions", "root_behavior_list"):
+        for entry in data.get(section, []) or []:
+            if entry.get("name") == "fall" and entry.get("frequency"):
+                changed.append(f"{section}:{entry['frequency']}->0")
+                entry["frequency"] = 0
+    if changed:
+        w.set_json("behaviors.json", data)
+    return changed
+
+
+# Action types whose init reads actionref->overwritten_locals[ID]->used. If a
+# behavior calls them directly, the first actionref has that pointer set to NULL.
+# See src/actions/{fall,move,look,offset,jump,breed,...}.c in wl_shimeji 0.0.2.
+VULNERABLE_MOVE_TYPES = {"Move"}
+INNER_SUFFIXES = ("Embedded", "Inner")
+
+
+def index_by_name(actions: list[dict]) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for action in actions:
+        name = action.get("name")
+        if name and name not in result:
+            result[name] = action
+    return result
+
+
+def is_vulnerable(action: dict | None) -> bool:
+    if not action:
+        return False
+    if action.get("type") in VULNERABLE_MOVE_TYPES:
+        return True
+    if action.get("type") != "Embedded":
+        return False
+    embedded_type = action.get("embedded_type")
+    return bool(embedded_type) and str(embedded_type).lower() != "none"
+
+
+def already_fixed(actions: list[dict], name: str) -> bool:
+    by_name = index_by_name(actions)
+    wrapper = by_name.get(name)
+    if not wrapper or wrapper.get("type") != "Sequence":
+        return False
+    for item in wrapper.get("content", []):
+        if item.get("type") != "ActionReference":
+            continue
+        inner_name = item.get("action_name")
+        if inner_name and inner_name != name and is_vulnerable(by_name.get(inner_name)):
+            return True
+    return False
+
+
+def unique_inner_name(actions: list[dict], name: str, action: dict) -> str:
+    used = {a.get("name") for a in actions}
+    base_suffix = "Embedded" if action.get("type") == "Embedded" else "Inner"
+    candidate = f"{name}{base_suffix}"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{name}{base_suffix}{suffix}"
+        suffix += 1
+    return candidate
+
+
+def make_wrapper(name: str, embedded_name: str) -> dict:
+    return {
+        "type": "Sequence",
+        "name": name,
+        "content": [{
+            "type": "ActionReference",
+            "action_name": embedded_name,
+            "duration": None,
+            "condition": None,
+            "locals_overrides": {},
+            "locals_count": 0,
+        }],
+        "content_count": 1,
+        "local_variables": {},
+        "local_variables_count": 0,
+        "embedded_type": None,
+        "loop": False,
+        "condition": None,
+        "border_type": "Any",
+    }
+
+
+def fix_embedded_actions(w: Wlshm) -> list[str]:
+    """Wrap vulnerable actions called directly by behaviors in Sequence."""
+    if not (w.has("actions.json") and w.has("behaviors.json")):
+        return []
+    actions = w.get_json("actions.json")
+    behaviors = w.get_json("behaviors.json")
+    by_name = index_by_name(actions)
+
+    called_directly: list[str] = []
+    for definition in behaviors.get("definitions", []) or []:
+        action_name = definition.get("action")
+        if (action_name in by_name and is_vulnerable(by_name[action_name])
+                and action_name not in called_directly):
+            called_directly.append(action_name)
+
+    changed: list[str] = []
+    for name in called_directly:
+        if already_fixed(actions, name):
+            continue
+        inner_name = unique_inner_name(actions, name, by_name[name])
+        by_name[name]["name"] = inner_name
+        actions.append(make_wrapper(name, inner_name))
+        by_name = index_by_name(actions)
+        changed.append(f"{name} -> {inner_name}")
+
+    if changed:
+        w.set_json("actions.json", actions)
+    return changed
+
+
+def is_no_image_placeholder(data: bytes) -> bool:
+    """Recognize the 'No image' placeholder produced by the converter (512x512, red)."""
+    try:
+        image = Image.open(io.BytesIO(data)).convert("RGBA")
+        if image.width < 256 or image.height < 256:
+            return False
+        bbox = image.getchannel("A").getbbox()
+        if not bbox:
+            return False
+        width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if not (1.5 <= width / max(height, 1) <= 4.0):
+            return False
+        visible = [px for px in image.getdata() if px[3] > 16]
+        if not visible or len(visible) / (image.width * image.height) > 0.25:
+            return False
+        colors = Counter(px[:3] for px in visible)
+        if len(colors) > 400:
+            return False
+        (r, g, b), count = colors.most_common(1)[0]
+        if count / len(visible) < 0.15:
+            return False
+        return (r >= 200 and g <= 80 and b <= 80) or min(r, g, b) >= 180
+    except Exception:
+        return False
+
+
+def safe_folder_name(name: str) -> str:
+    """Mantiene el nombre tal cual (el GUI busca substring), salvo '/' y NUL."""
+    return name.lower().replace("/", "_").replace("\\", "_").replace("\0", "")
+
+
+def pick_source_sprite(w: Wlshm, refs: set[str]) -> str | None:
+    """Pick a real, referenced sprite to use as the cover."""
+    preferred = ("shime0000.qoi", "shime1.qoi", "shime0001.qoi",
+                 "shime0.qoi", "shime0000.png", "shime1.png")
+    for name in preferred:
+        member = f"assets/{name}"
+        data = w.get(member)
+        if name in refs and data is not None and not is_no_image_placeholder(data):
+            return member
+    for name in sorted(refs):
+        member = f"assets/{name}"
+        data = w.get(member)
+        if data is not None and not is_no_image_placeholder(data):
+            return member
+    return None
+
+
+def fix_cover(w: Wlshm) -> list[str]:
+    """Remove stray placeholders and create a cover with a priority name."""
+    if not (w.has("manifest.json") and w.has("actions.json")):
+        return []
+    manifest = w.get_json("manifest.json")
+    name = str(manifest.get("display_name") or manifest.get("name") or "shimeji")
+    actions = w.get_json("actions.json")
+    refs = referenced_images(actions)
+    changed: list[str] = []
+
+    placeholders = []
+    for info, payload in w.members:
+        member = info.name
+        filename = member.rsplit("/", 1)[-1]
+        if (member.startswith("assets/")
+                and filename.lower().endswith((".qoi", ".png", ".webp"))
+                and filename not in refs
+                and is_no_image_placeholder(payload)):
+            placeholders.append(member)
+    for member in placeholders:
+        w.remove(member)
+        changed.append(f"placeholder removed: {member}")
+
+    source = pick_source_sprite(w, refs)
+    if source is None:
+        print("  warning: no valid sprites available for the cover", file=sys.stderr)
+        return changed
+
+    folder = safe_folder_name(name)
+    for filename in ("stand_01.qoi", "idle_01.qoi", "shime1.qoi"):
+        target = f"assets/{folder}/{filename}"
+        if name.lower() not in target.lower():
+            continue
+        current = w.get(target)
+        if current is not None and not is_no_image_placeholder(current):
+            return changed  # a valid cover already exists
+        w.set(target, w.get(source))
+        changed.append(f"cover created: {target} (copy of {source.rsplit('/', 1)[-1]})")
+        break
+    return changed
+
+
+FIX_FUNCTIONS = {
+    "scale": fix_sprite_scale,
+    "anchor": fix_sprite_anchor,
+    "fall": fix_random_fall,
+    "embedded": fix_embedded_actions,
+    "cover": fix_cover,
+}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("input", type=Path,
+                        help="Shimeji-EE/bundle ZIP or a .wlshm with --fix-only")
+    parser.add_argument("-o", "--output", type=Path, help="output .wlshm file")
+    parser.add_argument("-b", "--base", default="Shimeji.Shimeji",
+                        help="wl_shimeji prototype whose behavior is reused")
+    parser.add_argument("-f", "--force", action="store_true", help="overwrite output")
+    parser.add_argument("--fix-only", action="store_true",
+                        help="input is already a .wlshm: only apply the fixes")
+    parser.add_argument("--fixes", default=",".join(FIX_ORDER),
+                        help="fixes to apply, in order (default: %(default)s; "
+                             "'none' disables all)")
+    parser.add_argument("--no-fix", action="store_true", help="do not apply any fix")
+    parser.add_argument("--height", type=int, default=128,
+                        help="target height for the scale fix (default: 128)")
+    parser.add_argument("--import", dest="do_import", action="store_true",
+                        help="import the prototype into wl_shimeji when done")
+    args = parser.parse_args()
+
+    if not args.input.is_file():
+        parser.error(f"{args.input} does not exist")
+
+    if args.no_fix:
+        selected: list[str] = []
+    else:
+        selected = [item.strip() for item in args.fixes.split(",") if item.strip()]
+        if selected == ["none"]:
+            selected = []
+        unknown = [item for item in selected if item not in FIX_FUNCTIONS]
+        if unknown:
+            parser.error(f"unknown fixes: {', '.join(unknown)} "
+                         f"(available: {', '.join(FIX_ORDER)})")
+
+    try:
+        if args.fix_only:
+            if args.input.suffix.lower() != ".wlshm":
+                parser.error("--fix-only requires a .wlshm file as input")
+            output = args.output or args.input.with_name(
+                args.input.stem + ".fixed" + args.input.suffix)
+            if output.exists() and not args.force:
+                parser.error(f"{output} already exists (use -f to overwrite)")
+            print("[1] Loading .wlshm package")
+            package = Wlshm.open(args.input)
+            validate_wlshm(package)
+        else:
+            kind = detect_format(args.input)
+            print(f"[1] Detected format: {kind}")
+            if kind == "ee":
+                output = args.output or args.input.with_suffix(".wlshm")
+            else:
+                output = args.output or args.input.with_name(
+                    "Shimeji." + slugify(args.input.stem) + ".wlshm")
+
+            if output.exists() and not args.force:
+                parser.error(f"{output} already exists (use -f to overwrite)")
+
+            if kind == "ee":
+                print("[2] Using the official converter (shimejictl convert)")
+                convert_ee(args.input, output, args.force)
+            elif kind == "shimeji":
+                print("[2] Building .wlshm with shimeji sprites + base logic")
+                convert_shimeji(args.input, output, args.base, args.force)
+            else:
+                parser.error("unrecognized format: expected conf/+img/ or "
+                             "manifest.json+animation.json")
+
+            print(f"    written: {output} ({output.stat().st_size} bytes)")
+            print("[3] Validating package")
+            package = Wlshm.open(output)
+            validate_wlshm(package, min_assets=46)
+
+        if selected:
+            print(f"[4] Applying fixes: {', '.join(selected)}")
+            for name in selected:
+                if name == "scale":
+                    changes = fix_sprite_scale(package, args.height)
+                else:
+                    changes = FIX_FUNCTIONS[name](package)
+                detail = ", ".join(changes) if changes else "no changes"
+                print(f"    {name}: {detail}")
+            if package.dirty:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(package.save())
+                print(f"    package updated: {output} ({output.stat().st_size} bytes)")
+            print("[5] Re-validating corrected package")
+            manifest = validate_wlshm(package)
+        else:
+            print("[4] Fixes disabled")
+            manifest = validate_wlshm(package)
+
+        if args.do_import:
+            print("[6] Importing into wl_shimeji")
+            subprocess.run(["shimejictl", "prototypes", "import", "-f", str(output)],
+                           check=True)
+            print(f"    ready. Invoke with: wlshimeji summon "
+                  f"\"{manifest.get('display_name', '')}\"")
+        else:
+            print("[6] To use it: shimejictl prototypes import "
+                  f"{output} && wlshimeji summon \"{manifest.get('display_name', '')}\"")
+
+    except (RuntimeError, ValueError, OSError, zipfile.BadZipFile,
+            tarfile.TarError, subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
