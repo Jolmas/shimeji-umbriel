@@ -6,7 +6,10 @@ Se comunica con shimejictl y admite todas las funciones de gestión de mascotas,
 prototipos, entornos, configuración y del daemon.
 """
 
+import copy
 import errno
+import io
+import json
 import os
 import pty
 import re
@@ -14,6 +17,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 from pathlib import Path
@@ -40,10 +44,24 @@ DESKTOP = HOME / '.local/share/applications' / f'{APP_ID}.desktop'
 # Caché global de imágenes para mantener la interfaz fluida
 _PIXMAP_CACHE = {}
 
-# El plugin UmbrielSupport lee este archivo al cargarse. La variable de entorno
-# UMBRIEL_IE_MODE, cuando existe, tiene prioridad sobre el archivo.
+# Cada compositor tiene su propio directorio de plugins. wl_shimeji carga todos
+# los *.so que encuentra en `plugins_location`, por lo que solo debe apuntar a
+# uno de estos directorios cada vez.
 _xdg_config = os.environ.get('XDG_CONFIG_HOME', '').strip()
-UMBRIEL_IE_CONF = (Path(_xdg_config) if _xdg_config.startswith('/') else CONFIG) / 'umbriel-support.conf'
+PLUGIN_CONFIG_DIR = Path(_xdg_config) if _xdg_config.startswith('/') else CONFIG
+DAEMON_CONF = DATA / 'shimeji-overlayd.conf'
+
+PLUGIN_SESSIONS = [
+    ('labwc',   'Labwc',   HOME / '.local/lib/wl_shimeji_labwc'),
+    ('umbriel', 'Umbriel', HOME / '.local/lib/wl_shimeji_umbriel'),
+]
+PLUGIN_DIRS = {key: path for key, _label, path in PLUGIN_SESSIONS}
+PLUGIN_CONFS = {
+    key: PLUGIN_CONFIG_DIR / f'{key}-support.conf' for key in PLUGIN_DIRS
+}
+# Compatible con el nombre usado por versiones anteriores del GUI.
+UMBRIEL_IE_CONF = PLUGIN_CONFS['umbriel']
+
 IE_MODES = [
     ('active',  'Ventana activa (recomendado)'),
     ('focused', 'Ventana enfocada del workspace'),
@@ -65,10 +83,13 @@ def normalize_ie_mode(value):
     return IE_MODE_ALIASES.get(str(value).strip().lower())
 
 
-def read_umbriel_ie_mode():
-    """Lee `ie_mode` del archivo de ajustes del plugin, si existe."""
+def read_ie_mode(session):
+    """Lee `ie_mode` del archivo de ajustes del plugin indicado."""
+    path = PLUGIN_CONFS.get(session)
+    if path is None:
+        return None
     try:
-        text = UMBRIEL_IE_CONF.read_text(encoding='utf-8')
+        text = path.read_text(encoding='utf-8')
     except OSError:
         return None
     for line in text.splitlines():
@@ -76,30 +97,148 @@ def read_umbriel_ie_mode():
         if '=' not in line:
             continue
         key, value = line.split('=', 1)
-        if key.strip().lower() in ('ie_mode', 'umbriel_ie_mode'):
+        if key.strip().lower() in ('ie_mode', f'{session}_ie_mode'):
             mode = normalize_ie_mode(value)
             if mode:
                 return mode
     return None
 
 
-def effective_ie_mode():
-    """Modo que verá el plugin: entorno > archivo > valor por defecto."""
-    env_mode = normalize_ie_mode(os.environ.get('UMBRIEL_IE_MODE'))
-    return env_mode or read_umbriel_ie_mode() or 'active'
+def read_umbriel_ie_mode():
+    """Compatibilidad: lee el modo del plugin UmbrielSupport."""
+    return read_ie_mode('umbriel')
+
+
+def effective_ie_mode(session='umbriel'):
+    """Modo que verá el plugin: entorno > archivo > valor por defecto.
+
+    Labwc usa LABWC_IE_MODE; Umbriel usa UMBRIEL_IE_MODE.
+    """
+    env_name = f'{session.upper()}_IE_MODE'
+    env_mode = normalize_ie_mode(os.environ.get(env_name))
+    return env_mode or read_ie_mode(session) or 'active'
+
+
+def save_plugin_ie_mode(session, mode):
+    """Guarda `ie_mode` en la config del plugin de la sesión elegida.
+
+    Solo reemplaza esa clave; conserva otras opciones (por ejemplo
+    `ie_top_inset`) y los comentarios del archivo. También exporta la variable
+    de entorno correspondiente para los overlays que lance esta GUI.
+    """
+    if session not in PLUGIN_CONFS:
+        session = 'labwc'
+    mode = normalize_ie_mode(mode) or 'active'
+    path = PLUGIN_CONFS[session]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        lines = []
+
+    updated = []
+    replaced = False
+    for line in lines:
+        data = line.split('#', 1)[0].strip()
+        if '=' in data:
+            key = data.split('=', 1)[0].strip().lower()
+            if key in ('ie_mode', f'{session}_ie_mode'):
+                if not replaced:
+                    updated.append(f'ie_mode={mode}')
+                    replaced = True
+                continue
+        updated.append(line)
+
+    if not replaced:
+        if not updated:
+            labels = {key: label for key, label, _path in PLUGIN_SESSIONS}
+            updated.extend([
+                f'# {labels[session]}Support: ventana en la que las mascotas pueden pararse.',
+                '# active | focused | largest | none',
+            ])
+        updated.append(f'ie_mode={mode}')
+
+    path.write_text('\n'.join(updated) + '\n', encoding='utf-8')
+    os.environ[f'{session.upper()}_IE_MODE'] = mode
 
 
 def save_umbriel_ie_mode(mode):
-    """Guarda el modo y lo exporta para los overlays que lance esta GUI."""
-    mode = normalize_ie_mode(mode) or 'active'
-    UMBRIEL_IE_CONF.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        '# UmbrielSupport: ventana en la que las mascotas pueden pararse.',
-        '# active | focused | largest | none',
-        f'ie_mode={mode}',
-    ]
-    UMBRIEL_IE_CONF.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    os.environ['UMBRIEL_IE_MODE'] = mode
+    """Compatibilidad con código que llamaba directamente a esta función."""
+    save_plugin_ie_mode('umbriel', mode)
+
+
+def read_config_value(path, key):
+    """Lee una clave `clave=valor` de un archivo de configuración simple."""
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return None
+    for line in text.splitlines():
+        data = line.split('#', 1)[0].strip()
+        if '=' not in data:
+            continue
+        name, value = data.split('=', 1)
+        if name.strip().lower() == key.lower():
+            return value.strip()
+    return None
+
+
+def _same_path(a, b):
+    try:
+        return os.path.realpath(os.path.expanduser(a)) == os.path.realpath(os.path.expanduser(str(b)))
+    except (OSError, TypeError):
+        return False
+
+
+def detect_session():
+    """Infiere la sesión desde el entorno cuando no hay configuración válida."""
+    desktop = ' '.join(filter(None, (
+        os.environ.get('XDG_CURRENT_DESKTOP', ''),
+        os.environ.get('XDG_SESSION_DESKTOP', ''),
+    ))).lower()
+    if 'umbriel' in desktop:
+        return 'umbriel'
+    if 'labwc' in desktop or 'wlroots' in desktop:
+        return 'labwc'
+    return None
+
+
+def effective_session():
+    """Sesión activa según plugins_location, con detección por entorno."""
+    location = read_config_value(DAEMON_CONF, 'plugins_location')
+    for key, path in PLUGIN_DIRS.items():
+        if location and _same_path(location, path):
+            return key
+    return detect_session() or 'labwc'
+
+
+def save_plugins_location(session):
+    """Apunta plugins_location al directorio del plugin de la sesión elegida."""
+    if session not in PLUGIN_DIRS:
+        session = 'labwc'
+    target = str(PLUGIN_DIRS[session])
+    DAEMON_CONF.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = DAEMON_CONF.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        lines = []
+
+    updated = []
+    replaced = False
+    for line in lines:
+        data = line.split('#', 1)[0].strip()
+        if '=' in data:
+            key = data.split('=', 1)[0].strip().lower()
+            if key == 'plugins_location':
+                if not replaced:
+                    updated.append(f'plugins_location={target}')
+                    replaced = True
+                continue
+        updated.append(line)
+
+    if not replaced:
+        updated.append(f'plugins_location={target}')
+    DAEMON_CONF.write_text('\n'.join(updated) + '\n', encoding='utf-8')
 
 
 def run_ctl_sync(*args, input_str=None, timeout=12):
@@ -438,6 +577,177 @@ def prototype_store_path(info):
     return m.group(1).strip() if m else ''
 
 
+# ---------------------------------------------------------------------------
+# Gestión de nombres internos de los paquetes .wlshm
+#
+# Un .wlshm es una cabecera WLPK de 512 bytes seguida de un tar sin comprimir.
+# La cabecera contiene el nombre "interno" del prototipo (el que usa el daemon
+# como ruta de almacenamiento) y el manifest.json contiene el nombre visible.
+# Cuando importamos con -f, un nombre repetido sobrescribe el personaje anterior.
+# Estas funciones permiten detectar la colisión y crear una copia con otro
+# nombre antes de importarla, conservando así ambos personajes.
+# ---------------------------------------------------------------------------
+
+WLPK_MAGIC = b'WLPK'
+WLPK_HEADER_SIZE = 512
+
+
+def read_wlshm(path):
+    """Lee nombre interno, versión y manifest de un .wlshm. None si no es válido."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(raw) < WLPK_HEADER_SIZE or raw[:4] != WLPK_MAGIC:
+        return None
+
+    try:
+        name_len = raw[4]
+        name = raw[5:5 + name_len].decode('utf-8', errors='replace')
+        version_pos = 5 + name_len
+        version_len = raw[version_pos]
+        version = raw[version_pos + 1:version_pos + 1 + version_len].decode(
+            'utf-8', errors='replace')
+    except IndexError:
+        return None
+
+    manifest = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw[WLPK_HEADER_SIZE:]), mode='r:') as tf:
+            member = tf.extractfile('manifest.json')
+            if member:
+                manifest = json.loads(member.read().decode('utf-8', errors='replace'))
+    except Exception:
+        pass
+
+    return {'raw': raw, 'name': name, 'version': version, 'manifest': manifest}
+
+
+def write_renamed_wlshm(source, dest, new_name, display_name):
+    """Copia un .wlshm cambiando su nombre interno y, si se indica, el visible."""
+    data = read_wlshm(source)
+    if not data:
+        raise ValueError('el archivo no es un paquete .wlshm válido')
+
+    name_bytes = new_name.encode('utf-8')
+    version_bytes = data['version'].encode('utf-8')
+    if not name_bytes or len(name_bytes) > 255:
+        raise ValueError('el nombre interno debe tener entre 1 y 255 bytes')
+    header = (WLPK_MAGIC + bytes([len(name_bytes)]) + name_bytes
+              + bytes([len(version_bytes)]) + version_bytes)
+    if len(header) > WLPK_HEADER_SIZE:
+        raise ValueError('la cabecera WLPK resultant es demasiado larga')
+    header = header.ljust(WLPK_HEADER_SIZE, b'\x00')
+
+    manifest = dict(data['manifest'])
+    manifest['name'] = new_name
+    if display_name:
+        manifest['display_name'] = display_name
+    manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode('utf-8')
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(data['raw'][WLPK_HEADER_SIZE:]), mode='r:') as src_tar:
+        with tarfile.open(fileobj=buffer, mode='w', format=tarfile.USTAR_FORMAT) as dst_tar:
+            for info in src_tar.getmembers():
+                handle = src_tar.extractfile(info)
+                payload = handle.read() if handle is not None else b''
+                if info.name == 'manifest.json':
+                    payload = manifest_bytes
+                new_info = copy.copy(info)
+                new_info.size = len(payload)
+                dst_tar.addfile(new_info, io.BytesIO(payload) if handle is not None else None)
+
+    Path(dest).write_bytes(header + buffer.getvalue())
+
+
+def existing_prototype_names():
+    """Nombres internos ya instalados (según el daemon y los directorios)."""
+    names = set()
+    rc, out = run_ctl_sync('prototypes', 'list', '-d')
+    if rc == 0:
+        names.update(re.findall(r'^\s*Name:\s*(.+?)\s*$', out, re.M))
+    # Respaldo por si la lista detallada falla o el daemon aún no ha cargado algo
+    for root in (DATA / 'shimejis', DATA / 'prototypes'):
+        try:
+            names.update(p.name for p in root.iterdir() if p.is_dir())
+        except OSError:
+            pass
+    return names
+
+
+def unique_prototype_name(base, used):
+    """Devuelve un nombre libre añadiendo/incrementando un sufijo _2, _3, ..."""
+    base = (base or 'Shimeji').strip()
+    match = re.match(r'^(.*?)(?:_(\d+))?$', base)
+    stem = match.group(1) or base
+    number = int(match.group(2)) if match.group(2) else 1
+    candidate = base if number <= 1 else f'{stem}_{number}'
+    while candidate in used:
+        number += 1
+        candidate = f'{stem}_{number}'
+    return candidate
+
+
+def renamed_display_name(original, new_internal, old_internal):
+    """Mantiene el nombre visible con el mismo sufijo numérico que el interno."""
+    original = (original or '').strip() or old_internal
+    suffix = (new_internal[len(old_internal):]
+              if new_internal.startswith(old_internal) else '')
+    if not suffix:
+        return new_internal
+    number = suffix.lstrip('_')
+    if number.isdigit():
+        match = re.match(r'^(.*?)(?:_(\d+))?$', original)
+        stem = match.group(1) if match and match.group(1) else original
+        return f'{stem}_{number}'
+    return original + suffix
+
+
+def prepare_import_files(paths, workdir):
+    """
+    Prepara una lista de .wlshm para importar sin --force.
+
+    Devuelve (rutas_a_importar, avisos). Si el nombre interno ya existe, crea
+    en workdir una copia renombrada; en caso contrario usa el archivo original.
+    """
+    used = existing_prototype_names()
+    prepared = []
+    notices = []
+    for path in paths:
+        src = Path(path)
+        data = read_wlshm(src)
+        if not data or not data['name']:
+            prepared.append(src)
+            continue
+
+        old_name = data['name']
+        if old_name not in used:
+            prepared.append(src)
+            continue
+
+        try:
+            new_name = unique_prototype_name(old_name, used)
+            display = renamed_display_name(
+                data['manifest'].get('display_name'), new_name, old_name)
+            safe_name = re.sub(r'[^\w.\-]+', '_', new_name).strip('._') or 'shimeji'
+            dest = Path(workdir) / f'{safe_name}.wlshm'
+            suffix = 2
+            while dest.exists() and dest.resolve() != src.resolve():
+                dest = Path(workdir) / f'{safe_name}_{suffix}.wlshm'
+                suffix += 1
+            write_renamed_wlshm(src, dest, new_name, display)
+        except (OSError, ValueError, tarfile.TarError) as exc:
+            notices.append(f'No se pudo renombrar «{old_name}»: {exc}')
+            prepared.append(src)
+            continue
+
+        used.add(new_name)
+        prepared.append(dest)
+        notices.append(f'«{old_name}» ya existía: se importará como «{new_name}».')
+
+    return prepared, notices
+
+
 def parse_environments(text):
     """Analiza los entornos de la salida de `shimejictl environment list`."""
     envs = []
@@ -575,10 +885,15 @@ class ConverterDialog(QDialog):
             converted_files = sorted(str(p) for p in out_dir.glob('*.wlshm'))
             self.log_box.append(f"\n¡Conversión completada! El directorio de salida contiene {len(converted_files)} archivos .wlshm.\n")
             if self.auto_import.isChecked() and converted_files:
-                import_rc, import_out = run_ctl_sync('prototypes', 'import', '-f', *converted_files)
-                self.log_box.append(f"$ shimejictl prototypes import -f ...\n{import_out}\n")
+                with tempfile.TemporaryDirectory(prefix='wl-shimeji-gui-import-') as workdir:
+                    prepared, notices = prepare_import_files(converted_files, workdir)
+                    import_rc, import_out = run_ctl_sync('prototypes', 'import', *map(str, prepared))
+                    self.log_box.append(f"$ shimejictl prototypes import ...\n{import_out}\n")
+                    for notice in notices:
+                        self.log_box.append(notice)
                 if import_rc == 0:
-                    QMessageBox.information(self, 'Completado', f'Se han convertido e importado correctamente {len(converted_files)} personajes.')
+                    detail = ('\n\n' + '\n'.join(notices)) if notices else ''
+                    QMessageBox.information(self, 'Completado', f'Se han convertido e importado correctamente {len(converted_files)} personajes.{detail}')
                     if self.parent() and hasattr(self.parent(), 'refresh'):
                         self.parent().refresh()
                 else:
@@ -593,7 +908,7 @@ class SettingsDialog(QDialog):
     """
     Diálogo de ajustes completo que cubre todas las claves admitidas por `shimejictl config`:
     - Interacciones: BREEDING, DRAGGING, CURSOR_POSITION, WINDOW_INTERACTIONS, WINDOW_THROWING, WINDOW_THROW_POLICY, AFFORDANCES, DISMISS_ANIMATIONS
-    - Plugin Umbriel: ventana usada como IE (archivo umbriel-support.conf)
+    - Plugin de la sesión: ventana usada como IE y directorio de plugins
     - Multimonitor: ALLOW_THROWING_MULTIHEAD, ALLOW_DRAGGING_MULTIHEAD, UNIFIED_OUTPUTS
     - Visualización y escala: MASCOT_SCALE, OPACITY, WLR_SHELL_LAYER, INTERPOLATION_FRAMERATE
     - Límites y entrada: MASCOT_LIMIT, TABLETS_ENABLED, Inicio automático
@@ -622,9 +937,10 @@ class SettingsDialog(QDialog):
         for value, label in IE_MODES:
             self.ie_mode.addItem(label, value)
         self.ie_mode.setToolTip(
-            'Plugin UmbrielSupport: elige la ventana en la que las mascotas '
-            'pueden pararse. En wl_shimeji 0.0.2 las acciones IE también '
-            'requieren WINDOW_THROWING=true. Se aplica al reiniciar el daemon.'
+            'Elige la ventana en la que las mascotas pueden pararse. El valor '
+            'se guarda en la configuración del plugin de la sesión seleccionada '
+            '(labwc-support.conf o umbriel-support.conf). En wl_shimeji 0.0.2 '
+            'las acciones IE también requieren WINDOW_THROWING=true.'
         )
         self.throw_policy = QComboBox()
         self.throw_policy.addItems(['looping', 'clamp', 'bounce', 'ignore'])
@@ -636,7 +952,7 @@ class SettingsDialog(QDialog):
         f1.addRow(self.dismiss_anim)
         f1.addRow(self.win_interact)
         f1.addRow(self.win_throw)
-        f1.addRow('Mascotas sobre ventanas (UmbrielSupport):', self.ie_mode)
+        f1.addRow('Mascotas sobre ventanas (plugin de la sesión):', self.ie_mode)
         f1.addRow('Política al lanzar ventanas fuera de la pantalla:', self.throw_policy)
         self.tabs.addTab(t1, 'Interacción y comportamiento')
 
@@ -676,6 +992,18 @@ class SettingsDialog(QDialog):
         # Pestaña 3: Entrada y sistema
         t3 = QWidget()
         f3 = QFormLayout(t3)
+        self.session_combo = QComboBox()
+        for key, label, _path in PLUGIN_SESSIONS:
+            self.session_combo.addItem(label, key)
+        self.session_combo.setToolTip(
+            'Selecciona el compositor en uso. Al guardar se ajusta '
+            'plugins_location en ~/.local/share/wl_shimeji/shimeji-overlayd.conf '
+            'para cargar solo el plugin correspondiente.'
+        )
+        self.session_path = QLabel()
+        self.session_path.setWordWrap(True)
+        self.session_combo.currentIndexChanged.connect(self.update_session_path)
+
         self.maxn = QSpinBox()
         self.maxn.setRange(1, 2048)
         self.maxn.setValue(512)
@@ -683,10 +1011,13 @@ class SettingsDialog(QDialog):
         self.autostart = QCheckBox('Iniciar la interfaz automáticamente al iniciar sesión en KDE Plasma')
         self.autostart.setChecked(AUTOSTART.exists())
 
+        f3.addRow('Sesión / compositor activo:', self.session_combo)
+        f3.addRow('Directorio de plugins:', self.session_path)
         f3.addRow('Número máximo de personajes (MASCOT_LIMIT):', self.maxn)
         f3.addRow(self.tablets)
         f3.addRow(self.autostart)
         self.tabs.addTab(t3, 'Sistema y entrada')
+        self.update_session_path()
 
         # Pestaña 4: Configuración completa sin procesar
         t4 = QWidget()
@@ -712,6 +1043,11 @@ class SettingsDialog(QDialog):
 
         self.load_config()
 
+    def update_session_path(self):
+        """Muestra el directorio de plugins de la sesión seleccionada."""
+        key = self.session_combo.currentData()
+        self.session_path.setText(str(PLUGIN_DIRS.get(key, '')))
+
     def load_config(self):
         rc, out = run_ctl_sync('config', 'list')
         self.raw_text.setPlainText(out)
@@ -734,7 +1070,13 @@ class SettingsDialog(QDialog):
         self.win_interact.setChecked(parse_bool('WINDOW_INTERACTIONS', False))
         self.win_throw.setChecked(parse_bool('WINDOW_THROWING', False))
 
-        idx_mode = self.ie_mode.findData(effective_ie_mode())
+        session = effective_session()
+        idx_session = self.session_combo.findData(session)
+        if idx_session >= 0:
+            self.session_combo.setCurrentIndex(idx_session)
+        self.update_session_path()
+
+        idx_mode = self.ie_mode.findData(effective_ie_mode(session))
         if idx_mode >= 0:
             self.ie_mode.setCurrentIndex(idx_mode)
 
@@ -801,11 +1143,20 @@ class SettingsDialog(QDialog):
             if rc != 0:
                 errors.append(f"{key}: {out.strip()}")
 
-        # Preferencia del plugin UmbrielSupport (no es una clave de shimejictl)
+        # Selección de sesión: plugins_location no es una clave mutable por
+        # shimejictl mientras el daemon está corriendo, así que se edita el
+        # archivo de configuración conservando el resto de claves.
+        session = self.session_combo.currentData() or 'labwc'
         try:
-            save_umbriel_ie_mode(self.ie_mode.currentData())
+            save_plugins_location(session)
         except OSError as e:
-            errors.append(f"Modo de ventanas (UmbrielSupport): {e}")
+            errors.append(f"Sesión / plugins_location: {e}")
+
+        # Modo de IE en la configuración del plugin de esa sesión.
+        try:
+            save_plugin_ie_mode(session, self.ie_mode.currentData())
+        except OSError as e:
+            errors.append(f"Modo de ventanas ({session}): {e}")
 
         # Actualizar la entrada de inicio automático
         try:
@@ -831,7 +1182,8 @@ class SettingsDialog(QDialog):
         self.load_config()
         if not errors:
             mensaje = ('La configuración se ha aplicado correctamente.\n'
-                       'El modo de ventanas se aplica al reiniciar el servicio.')
+                       'La selección de sesión y el modo de ventanas se aplican '
+                       'al reiniciar el servicio.')
             restart = getattr(self.parent(), 'restart_daemon', None)
             if callable(restart):
                 reply = QMessageBox.question(
@@ -1369,6 +1721,10 @@ class MainWindow(QMainWindow):
         self.run_async(['prototypes', 'reload-all'], 'Enviando la señal de recarga de personajes al daemon...', callback=lambda rc, _: self.refresh())
 
     def add_role(self):
+        if self.current_worker and self.current_worker.isRunning():
+            QMessageBox.warning(self, 'Aviso', 'Hay otro comando en curso; espera a que termine antes de añadir un personaje.')
+            return
+
         f, _ = QFileDialog.getOpenFileName(
             self, 'Añadir personaje', str(HOME),
             'Personajes Shimeji (*.wlshm *.zip);;Paquetes de personajes wl_shimeji (*.wlshm);;ZIP de Shimeji-EE (*.zip);;Todos los archivos (*)'
@@ -1377,7 +1733,25 @@ class MainWindow(QMainWindow):
             return
 
         if f.lower().endswith('.wlshm'):
-            self.run_async(['prototypes', 'import', '-f', f], f'Importando {Path(f).name}...', callback=lambda rc, _: self.refresh())
+            # El archivo renombrado debe vivir hasta que termine la importación
+            workdir = tempfile.mkdtemp(prefix='wl-shimeji-gui-import-')
+            try:
+                prepared, notices = prepare_import_files([f], workdir)
+            except Exception as exc:
+                shutil.rmtree(workdir, ignore_errors=True)
+                QMessageBox.warning(self, 'Añadir personaje', f'No se pudo preparar la importación:\n{exc}')
+                return
+
+            def on_import_done(rc, out):
+                shutil.rmtree(workdir, ignore_errors=True)
+                for notice in notices:
+                    self.log(notice)
+                self.refresh()
+                if rc == 0 and notices:
+                    QMessageBox.information(self, 'Personaje importado', '\n'.join(notices))
+
+            self.run_async(['prototypes', 'import', str(prepared[0])],
+                           f'Importando {Path(f).name}...', callback=on_import_done)
             return
 
         # Es un archivo ZIP: convertir en un directorio temporal y después importar
@@ -1389,11 +1763,15 @@ class MainWindow(QMainWindow):
             if p.returncode or not files:
                 QMessageBox.warning(self, 'Añadir personaje', 'La conversión ha fallado o no se han encontrado recursos válidos de Shimeji-EE en el ZIP.\n\n' + out[-2000:])
                 return
-            rc, imp_out = run_ctl_sync('prototypes', 'import', '-f', *files)
-            self.log(f"$ shimejictl prototypes import -f ...\n{imp_out}")
+            prepared, notices = prepare_import_files(files, td)
+            rc, imp_out = run_ctl_sync('prototypes', 'import', *map(str, prepared))
+            self.log(f"$ shimejictl prototypes import ...\n{imp_out}")
+            for notice in notices:
+                self.log(notice)
             if rc == 0:
                 self.refresh()
-                QMessageBox.information(self, 'Correcto', f'¡Se han convertido e importado correctamente {len(files)} prototipos de personajes!')
+                detail = ('\n\n' + '\n'.join(notices)) if notices else ''
+                QMessageBox.information(self, 'Correcto', f'¡Se han convertido e importado correctamente {len(files)} prototipos de personajes!{detail}')
             else:
                 QMessageBox.warning(self, 'Error de importación', f'La conversión se completó, pero se produjo un error durante la importación:\n{imp_out}')
 
