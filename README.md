@@ -8,6 +8,8 @@ Es el equivalente al plugin `kwinsupport`, pero para sesiones Umbriel. No depend
 de D-Bus ni de KWin: toda la comunicación se hace con el socket UNIX JSON de
 Umbriel.
 
+![image](image.png)
+
 ## Qué hace
 
 - Se suscribe a los eventos `windows` y `outputs` de Umbriel y mantiene un
