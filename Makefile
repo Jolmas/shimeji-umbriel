@@ -7,6 +7,9 @@
 CC              ?= cc
 PKG_CONFIG      ?= pkg-config
 PREFIX          ?= /usr/local
+# wl_shimeji loads every *.so found in plugins_location; keep one plugin per
+# directory. Point plugins_location in shimeji-overlayd.conf to this path.
+PLUGINS_DIR     ?= $(HOME)/.local/lib/wl_shimeji_umbriel
 BUILDDIR        ?= build
 PLUGINS_OUT_DIR ?= $(BUILDDIR)/plugins
 
@@ -51,8 +54,8 @@ test: $(TEST_TARGET) integration
 	$(TEST_TARGET)
 
 install: $(TARGET)
-	install -d $(DESTDIR)$(PREFIX)/lib/wl_shimeji/
-	install -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/lib/wl_shimeji/
+	install -d $(DESTDIR)$(PLUGINS_DIR)/
+	install -m 0755 $(TARGET) $(DESTDIR)$(PLUGINS_DIR)/
 
 clean:
 	rm -rf $(BUILDDIR)

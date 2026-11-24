@@ -53,10 +53,19 @@ make PREFIX=/usr WL_SHIMEJI_INCLUDEDIR=/usr/include WL_SHIMEJI_LIBDIR=/usr/lib
 cd wl_shimeji.umbriel
 make          # genera build/plugins/libumbrielsupport.so
 make test     # pruebas del parser + integración con un Umbriel simulado
-sudo make install
+make install  # instala en ~/.local/lib/wl_shimeji_umbriel/
 ```
 
-`make install` copia la librería en `$PREFIX/lib/wl_shimeji/`.
+`make install` copia la librería en `$(PLUGINS_DIR)`, que por defecto es
+`~/.local/lib/wl_shimeji_umbriel/`. No hace falta `sudo`. Si prefieres instalar
+en otro sitio, cambia `plugins_location` en
+`~/.local/share/wl_shimeji/shimeji-overlayd.conf` para que apunte al directorio
+elegido:
+
+```sh
+make PLUGINS_DIR=/usr/local/lib/wl_shimeji_umbriel install
+```
+
 También se puede compilar como subdirectorio de `wl_shimeji/src/plugins/`:
 
 ```sh
