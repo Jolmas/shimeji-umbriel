@@ -184,6 +184,15 @@ def validate_wlshm(w: Wlshm, *, min_assets: int = 1) -> dict:
     return manifest
 
 
+def is_valid_wlshm(path: Path) -> bool:
+    """A failed shimejictl conversion may leave a 0-byte .wlshm behind."""
+    try:
+        Wlshm(path.read_bytes())
+        return True
+    except Exception:
+        return False
+
+
 def convert_ee(input_zip: Path, output: Path, force: bool) -> Path:
     """Step 1a: real Shimeji-EE instance -> official converter."""
     if shutil.which("shimejictl") is None:
@@ -194,11 +203,19 @@ def convert_ee(input_zip: Path, output: Path, force: bool) -> Path:
             input="A\n", text=True, capture_output=True,
         )
         print(result.stdout.strip())
+        details = (result.stdout + "\n" + result.stderr).strip()
+        failures = [line for line in details.splitlines()
+                    if "conversion failed" in line.lower()
+                    or "no prototypes selected" in line.lower()]
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "shimejictl convert failed")
-        converted = sorted(Path(td).glob("*.wlshm"))
+        converted = [p for p in sorted(Path(td).glob("*.wlshm")) if is_valid_wlshm(p)]
         if not converted:
-            raise RuntimeError("shimejictl convert produced no .wlshm")
+            detail = f": {'; '.join(failures)}" if failures else ""
+            raise RuntimeError(f"shimejictl convert produced no valid .wlshm{detail}")
+        if failures:
+            print("warning: shimejictl reported failed conversions; skipping those prototypes",
+                  file=sys.stderr)
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(converted[0], output)
     return output
@@ -208,7 +225,20 @@ def convert_shimeji(input_zip: Path, output: Path, base_name: str, force: bool) 
     """Step 1b/2: shimeji bundle -> .wlshm reusing a base prototype."""
     base = SHIMEJIS / base_name
     if not (base / "actions.json").is_file():
-        raise RuntimeError(f"base prototype does not exist: {base}")
+        # The script's default base is not always installed; reuse any real
+        # prototype instead of blocking the conversion.
+        candidates = sorted(p for p in SHIMEJIS.iterdir() if p.is_dir()
+                            and (p / "actions.json").is_file()) if SHIMEJIS.is_dir() else []
+        hint = slugify(input_zip.stem)
+        chosen = next((p for p in candidates
+                       if hint and (hint in slugify(p.name).replace("shimeji-", "")
+                                    or slugify(p.name).replace("shimeji-", "") in hint)), None)
+        chosen = chosen or (candidates[0] if candidates else None)
+        if chosen is None:
+            raise RuntimeError(
+                f"base prototype does not exist: {base} and no installed prototype has actions.json")
+        print(f"warning: base '{base_name}' not available; using '{chosen.name}'", file=sys.stderr)
+        base = chosen
 
     with zipfile.ZipFile(input_zip) as zf:
         names = zf.namelist()
@@ -219,6 +249,10 @@ def convert_shimeji(input_zip: Path, output: Path, base_name: str, force: bool) 
         with tempfile.TemporaryDirectory() as td:
             zf.extractall(td)
             sprite_dir = Path(td) / "sprites"
+            available_sprites = {int(p.stem) for p in sprite_dir.glob("*.webp")
+                                 if p.stem.isdigit()}
+            if not available_sprites:
+                raise RuntimeError("the bundle contains no sprites/*.webp")
 
             display_name = bundle_manifest.get("name") or input_zip.stem
             name = "Shimeji." + slugify(display_name)
@@ -252,9 +286,14 @@ def convert_shimeji(input_zip: Path, output: Path, base_name: str, force: bool) 
                 tar.addfile(dirinfo)
 
                 for n in range(1, 47):
-                    sprite = sprite_dir / f"{SPRITE_FOR[n]:04d}.webp"
+                    requested = SPRITE_FOR[n]
+                    sprite = sprite_dir / f"{requested:04d}.webp"
                     if not sprite.is_file():
-                        raise RuntimeError(f"missing sprite {sprite.name} in the bundle")
+                        nearest = min(available_sprites,
+                                      key=lambda v: (abs(v - requested), v))
+                        print(f"warning: sprite {requested:04d} missing; using {nearest:04d}",
+                              file=sys.stderr)
+                        sprite = sprite_dir / f"{nearest:04d}.webp"
                     image = Image.open(sprite).convert("RGBA")
                     image = image.resize((128, 128), Image.LANCZOS)
                     add(f"assets/shime{n}.qoi", encode_qoi(image))
